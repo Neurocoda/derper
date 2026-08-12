@@ -108,17 +108,26 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             DERP_VERSION=${{ steps.ver.outputs.version }}
+          # GitHub Actions 内置缓存: 跨 run 复用 Go 依赖下载与编译层
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       # 冒烟测试：dev 模式启动容器，验证 HTTP 页面 + DERP 协议端点
+      # 镜像来源: PR 用本地 daemon 的构建产物；push/tag 从 GHCR 拉取
       - name: Smoke test
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          TAG="${{ steps.meta.outputs.tag }}"
-          if [ -z "$TAG" ]; then
-            # PR 时 meta 可能没有 tag 输出，用 build 输出的 image id
-            TAG="${{ steps.build.outputs.imageid }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR: 构建已 load 进本地 daemon
+            IMG="${{ steps.build.outputs.imageid }}"
+          else
+            # push/tag: 从 GHCR 拉取第一个 tag（latest 或 v*）验证已发布产物
+            IMG="$(echo "$META_TAGS" | head -1)"
+            docker pull "$IMG"
           fi
-          echo "测试镜像: $TAG"
-          docker run -d --name derper-smoke -p 3340:3340 "$TAG" --dev
+          echo "测试镜像: $IMG"
+          docker run -d --name derper-smoke -p 3340:3340 "$IMG" --dev
           # 等待启动（最多 20s）
           for i in $(seq 1 20); do
             curl -sf -m 2 http://localhost:3340/ >/dev/null 2>&1 && break
