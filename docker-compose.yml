@@ -1,0 +1,34 @@
+# derper — Tailscale DERP server (自建镜像)
+#
+# 部署前提（官方文档要求，详见 README）:
+#   1. 服务器必须直连公网，不能 NAT/防火墙/负载均衡
+#   2. 80/443(TCP) + 3478(UDP) 对外开放
+#   3. 允许双向 ICMP
+#   4. --verify-clients 要求宿主机同机运行 tailscaled 并加入 tailnet
+#
+# 用法:
+#   1. docker compose build
+#   2. 修改 --hostname 为你的域名
+#   3. docker compose up -d
+#   4. 在 tailnet policy file 添加 derpMap 配置（RegionID 900-999）
+
+services:
+  derper:
+    build: .
+    image: derper:latest
+    container_name: derper
+    restart: unless-stopped
+    ports:
+      - "80:80"          # HTTP (ACME http-01 验证, 端口不可自定义)
+      - "443:443"        # HTTPS / WSS 主流量
+      - "3478:3478/udp"  # STUN
+    volumes:
+      - ./certs:/certs   # 证书目录 (letsencrypt 模式自动写入)
+    command:
+      - --hostname=derp.example.com   # ← 改成你的域名
+      - --certdir=/certs
+      - --verify-clients              # 只允许 tailnet 内认证客户端 (需宿主同机跑 tailscaled)
+      # 可选参数:
+      # - --certmode=letsencrypt      # 默认; 公网 443 可达即自动签证书
+      # - --stun=false                # 内网自用可关掉 STUN
+      # - --http-port=-1              # 禁用 HTTP(80) —— 但会破坏 ACME 验证, 慎用

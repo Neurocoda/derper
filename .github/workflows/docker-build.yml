@@ -1,0 +1,126 @@
+# 多架构构建 + 发布 GitHub Container Registry (GHCR)
+#
+# 触发:
+#   - push 到 main       → 构建并推送 latest + sha-<7位>
+#   - tag v*             → 构建并推送 <tag> + latest
+#   - PR                 → 仅构建单平台 + 冒烟测试，不推送
+#   - workflow_dispatch  → 手动构建，可用 derp_version 输入固定版本
+#
+# 版本策略:
+#   - 默认自动查询 proxy.golang.org 上 tailscale.com 最新版本，构建时传入
+#     DERP_VERSION 构建参数 → 自动跟踪上游，避免 go install @latest 的不可复现性
+#   - 需要固定版本时: workflow_dispatch 填版本号，或打 v1.2.3 标签并覆盖
+#
+# 架构: linux/amd64 (服务器), linux/arm64 (Apple Silicon/ARM 服务器), linux/arm/v7 (树莓派等)
+
+name: build-and-push
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      derp_version:
+        description: "derper 版本号（如 v1.102.2），留空则自动取上游最新"
+        required: false
+        type: string
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # 构建的目标平台；按需增删（如去掉 arm/v7 可加快构建）
+  PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 解析 derper 版本：
+      #   1. workflow_dispatch 显式指定 → 用之
+      #   2. 否则查询 Go module proxy 的最新版本
+      - name: Resolve derper version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.derp_version }}" ]; then
+            echo "version=${{ inputs.derp_version }}" >> "$GITHUB_OUTPUT"
+            echo "手动指定版本: ${{ inputs.derp_version }}"
+          else
+            V=$(curl -s https://proxy.golang.org/tailscale.com/@latest | jq -r .Version)
+            echo "version=${V}" >> "$GITHUB_OUTPUT"
+            echo "自动获取上游最新版本: ${V}"
+          fi
+
+      # 计算镜像标签:
+      #   tag v*     → v*, latest
+      #   main       → latest, sha-xxxxxxx
+      #   PR/dispatch → 用 sha 标签（dispatch 也可手动指定 tag 分支）
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=derper-${{ steps.ver.outputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # PR 只构建当前 runner 平台（x86_64）用于冒烟测试，节省时间
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || env.PLATFORMS }}
+          push: ${{ github.event_name != 'pull_request' }}
+          # PR 构建需要 load 进本地 daemon 供冒烟测试使用
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DERP_VERSION=${{ steps.ver.outputs.version }}
+
+      # 冒烟测试：dev 模式启动容器，验证 HTTP 页面 + DERP 协议端点
+      - name: Smoke test
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          if [ -z "$TAG" ]; then
+            # PR 时 meta 可能没有 tag 输出，用 build 输出的 image id
+            TAG="${{ steps.build.outputs.imageid }}"
+          fi
+          echo "测试镜像: $TAG"
+          docker run -d --name derper-smoke -p 3340:3340 "$TAG" --dev
+          # 等待启动（最多 20s）
+          for i in $(seq 1 20); do
+            curl -sf -m 2 http://localhost:3340/ >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # 1) 首页应包含 DERP 标识
+          curl -sf -m 5 http://localhost:3340/ | grep -q "DERP" && echo "✓ 首页 OK"
+          # 2) /derp 应返回 426 (WebSocket 升级要求) — Tailscale 客户端握手的预期行为
+          code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://localhost:3340/derp)
+          [ "$code" = "426" ] && echo "✓ /derp 端点 OK (HTTP 426)" || { echo "✗ /derp 返回 $code"; exit 1; }
+          docker rm -f derper-smoke >/dev/null
