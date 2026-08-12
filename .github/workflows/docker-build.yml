@@ -15,6 +15,12 @@
 
 name: build-and-push
 
+# 并发控制: 同一分支/标签同时只跑一个构建，
+# 新 push 会取消排队中的旧 run（节省 Actions 配额，避免并行重复构建）
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [main]
