@@ -1,25 +1,13 @@
-# 多架构构建 + 发布 GitHub Container Registry (GHCR)
+# 多架构构建并发布到 GitHub Container Registry (GHCR)
 #
-# 触发:
-#   - push 到 main       → 构建并推送 latest + sha-<7位>
-#   - tag v*             → 构建并推送 <tag> + latest
-#   - PR                 → 仅构建单平台 + 冒烟测试，不推送
-#   - workflow_dispatch  → 手动构建，可用 derp_version 输入固定版本
-#
-# 版本策略:
-#   - 默认自动查询 proxy.golang.org 上 tailscale.com 最新版本，构建时传入
-#     DERP_VERSION 构建参数 → 自动跟踪上游，避免 go install @latest 的不可复现性
-#   - 需要固定版本时: workflow_dispatch 填版本号，或打 v1.2.3 标签并覆盖
-#
-# 架构: linux/amd64 (服务器), linux/arm64 (Apple Silicon/ARM 服务器), linux/arm/v7 (树莓派等)
+# 发布门禁：先在 amd64 上构建并验证入口脚本、ACME HTTP 路径和 DERP 端点；
+# 全部通过后才构建并推送多架构镜像，避免坏镜像先覆盖 latest。
 
 name: build-and-push
 
-# 并发控制: 同一分支/标签同时只跑一个构建，
-# 新 push 会取消排队中的旧 run（节省 Actions 配额，避免并行重复构建）
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 on:
   push:
@@ -27,21 +15,23 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       derp_version:
-        description: "derper 版本号（如 v1.102.2），留空则自动取上游最新"
+        description: "tailscale.com module 版本（如 v1.102.2）；留空则使用上游最新稳定版"
         required: false
         type: string
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
-  # 构建的目标平台；按需增删（如去掉 arm/v7 可加快构建）
   PLATFORMS: linux/amd64,linux/arm64,linux/arm/v7
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
@@ -56,36 +46,162 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 解析 derper 版本：
-      #   1. workflow_dispatch 显式指定 → 用之
-      #   2. 否则查询 Go module proxy 的最新版本
-      - name: Resolve derper version
+      - name: Resolve Tailscale, revision, and Go versions
         id: ver
+        env:
+          REQUESTED_VERSION: ${{ inputs.derp_version }}
+          GIT_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
-          if [ -n "${{ inputs.derp_version }}" ]; then
-            echo "version=${{ inputs.derp_version }}" >> "$GITHUB_OUTPUT"
-            echo "手动指定版本: ${{ inputs.derp_version }}"
+          set -euo pipefail
+
+          if [ -n "$REQUESTED_VERSION" ]; then
+            VERSION="$REQUESTED_VERSION"
+          elif [ -n "$GIT_TAG" ]; then
+            # v* 仓库标签与实际构建的 Tailscale module 版本保持一致。
+            VERSION="$GIT_TAG"
           else
-            V=$(curl -s https://proxy.golang.org/tailscale.com/@latest | jq -r .Version)
-            echo "version=${V}" >> "$GITHUB_OUTPUT"
-            echo "自动获取上游最新版本: ${V}"
+            VERSION=$(curl --fail --silent --show-error --retry 3 --connect-timeout 10 --max-time 30 \
+              https://proxy.golang.org/tailscale.com/@latest | jq -er .Version)
           fi
 
-      # 计算镜像标签:
-      #   tag v*     → v*, latest
-      #   main       → latest, sha-xxxxxxx
-      #   PR/dispatch → 用 sha 标签（dispatch 也可手动指定 tag 分支）
-      - name: Compute image tags
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]]; then
+            echo "无效的 tailscale.com 版本: $VERSION" >&2
+            exit 1
+          fi
+
+          MOD_FILE=$(mktemp)
+          INFO_FILE=$(mktemp)
+          curl --fail --silent --show-error --retry 3 --connect-timeout 10 --max-time 30 \
+            "https://proxy.golang.org/tailscale.com/@v/${VERSION}.mod" -o "$MOD_FILE"
+          curl --fail --silent --show-error --retry 3 --connect-timeout 10 --max-time 30 \
+            "https://proxy.golang.org/tailscale.com/@v/${VERSION}.info" -o "$INFO_FILE"
+
+          GO_VERSION=$(perl -ne 'print "$1\n" and exit if /^go\s+(\S+)/' "$MOD_FILE")
+          UPSTREAM_REVISION=$(jq -er '.Origin.Hash' "$INFO_FILE")
+
+          if ! [[ "$GO_VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "无法从 tailscale.com@$VERSION 的 go.mod 解析 Go 版本" >&2
+            exit 1
+          fi
+          if ! [[ "$UPSTREAM_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "无法解析 Tailscale git revision" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools inspect "golang:${GO_VERSION}-alpine" >/dev/null
+
+          {
+            echo "derp_version=$VERSION"
+            echo "go_version=$GO_VERSION"
+            echo "upstream_revision=$UPSTREAM_REVISION"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tailscale: $VERSION"
+          echo "Revision:  $UPSTREAM_REVISION"
+          echo "Go:        $GO_VERSION"
+
+      - name: Compute publication tags and labels
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE }}
           tags: |
             type=ref,event=tag
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            type=sha,prefix=sha-,format=short
-            type=raw,value=derper-${{ steps.ver.outputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' }}
+            type=raw,value=tailscale-${{ steps.ver.outputs.derp_version }}
+            type=sha,prefix=sha-,format=short,enable=${{ github.event_name == 'push' }}
+          labels: |
+            org.opencontainers.image.description=Tailscale DERP server built from tailscale.com/cmd/derper@${{ steps.ver.outputs.derp_version }}
+            io.github.neurocoda.derper.tailscale-version=${{ steps.ver.outputs.derp_version }}
+            io.github.neurocoda.derper.tailscale-revision=${{ steps.ver.outputs.upstream_revision }}
+            io.github.neurocoda.derper.go-version=${{ steps.ver.outputs.go_version }}
 
+      # 发布前门禁：构建一个只存在于 runner 本地的 amd64 镜像。
+      - name: Build validation image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          pull: true
+          tags: derper:ci-test
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DERP_VERSION=${{ steps.ver.outputs.derp_version }}
+            GO_VERSION=${{ steps.ver.outputs.go_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate CLI, ACME startup, persistence, and DERP endpoints
+        run: |
+          set -euo pipefail
+          cleanup() {
+            docker rm -f derper-smoke derper-acme-smoke >/dev/null 2>&1 || true
+            rm -rf "$RUNNER_TEMP/derper-smoke"
+          }
+          trap cleanup EXIT
+          mkdir -p "$RUNNER_TEMP/derper-smoke/certs" "$RUNNER_TEMP/derper-smoke/data"
+
+          # 必填域名缺失时必须 fail-fast，不能静默使用 derp.tailscale.com。
+          set +e
+          docker run --rm derper:ci-test >"$RUNNER_TEMP/missing-host.log" 2>&1
+          rc=$?
+          set -e
+          [ "$rc" -eq 64 ]
+          grep -q DERP_HOSTNAME "$RUNNER_TEMP/missing-host.log"
+
+          # 验证 Let's Encrypt 模式启动、HTTP-01 路径和持久化 DERP key。
+          docker run -d --name derper-acme-smoke \
+            -p 3080:80 -p 3443:443 -p 3479:3478/udp \
+            -e DERP_HOSTNAME=derp.invalid \
+            -e DERP_ACME_EMAIL=admin@example.com \
+            -e DERP_VERIFY_CLIENTS=false \
+            -v "$RUNNER_TEMP/derper-smoke/certs:/certs" \
+            -v "$RUNNER_TEMP/derper-smoke/data:/var/lib/derper" \
+            derper:ci-test
+
+          for _ in $(seq 1 20); do
+            code=$(curl --silent --max-time 2 -o /dev/null -w '%{http_code}' \
+              http://localhost:3080/generate_204 || true)
+            [ "$code" = "204" ] && break
+            sleep 1
+          done
+          [ "$code" = "204" ] || { docker logs derper-acme-smoke; exit 1; }
+          docker logs derper-acme-smoke 2>&1 | grep -q "Let's Encrypt 自动申请并续期"
+          docker logs derper-acme-smoke 2>&1 | grep -q "STUN server listening"
+          test -s "$RUNNER_TEMP/derper-smoke/data/derper.key"
+          key_before=$(docker run --rm \
+            -v "$RUNNER_TEMP/derper-smoke/data:/data:ro" \
+            derper:ci-test sha256sum /data/derper.key | cut -d' ' -f1)
+          docker rm -f derper-acme-smoke >/dev/null
+
+          docker run -d --name derper-acme-smoke \
+            -p 3080:80 -p 3443:443 -p 3479:3478/udp \
+            -e DERP_HOSTNAME=derp.invalid \
+            -e DERP_VERIFY_CLIENTS=false \
+            -v "$RUNNER_TEMP/derper-smoke/certs:/certs" \
+            -v "$RUNNER_TEMP/derper-smoke/data:/var/lib/derper" \
+            derper:ci-test
+          sleep 2
+          key_after=$(docker run --rm \
+            -v "$RUNNER_TEMP/derper-smoke/data:/data:ro" \
+            derper:ci-test sha256sum /data/derper.key | cut -d' ' -f1)
+          [ "$key_before" = "$key_after" ]
+          docker rm -f derper-acme-smoke >/dev/null
+
+          # 保持 derper 原生 --dev CLI 兼容，并验证协议端点。
+          docker run -d --name derper-smoke -p 3340:3340 derper:ci-test --dev
+          for _ in $(seq 1 20); do
+            if curl --fail --silent --max-time 2 http://localhost:3340/ >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent --max-time 5 http://localhost:3340/ | grep -q DERP
+          [ "$(curl --silent --max-time 5 -o /dev/null -w '%{http_code}' http://localhost:3340/derp)" = "426" ]
+          [ "$(curl --silent --max-time 5 -o /dev/null -w '%{http_code}' http://localhost:3340/derp/probe)" = "200" ]
+
+      # 只有前面的验证全部成功才登录并发布。
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -94,48 +210,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        id: build
+      - name: Build and push multi-platform image
+        if: github.event_name != 'pull_request'
+        id: publish
         uses: docker/build-push-action@v6
         with:
           context: .
-          # PR 只构建当前 runner 平台（x86_64）用于冒烟测试，节省时间
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || env.PLATFORMS }}
-          push: ${{ github.event_name != 'pull_request' }}
-          # PR 构建需要 load 进本地 daemon 供冒烟测试使用
-          load: ${{ github.event_name == 'pull_request' }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          pull: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            DERP_VERSION=${{ steps.ver.outputs.version }}
-          # GitHub Actions 内置缓存: 跨 run 复用 Go 依赖下载与编译层
+            DERP_VERSION=${{ steps.ver.outputs.derp_version }}
+            GO_VERSION=${{ steps.ver.outputs.go_version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 冒烟测试：dev 模式启动容器，验证 HTTP 页面 + DERP 协议端点
-      # 镜像来源: PR 用本地 daemon 的构建产物；push/tag 从 GHCR 拉取
-      - name: Smoke test
+      - name: Verify published manifest
+        if: github.event_name != 'pull_request'
         env:
           META_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            # PR: 构建已 load 进本地 daemon
-            IMG="${{ steps.build.outputs.imageid }}"
-          else
-            # push/tag: 从 GHCR 拉取第一个 tag（latest 或 v*）验证已发布产物
-            IMG="$(echo "$META_TAGS" | head -1)"
-            docker pull "$IMG"
-          fi
-          echo "测试镜像: $IMG"
-          docker run -d --name derper-smoke -p 3340:3340 "$IMG" --dev
-          # 等待启动（最多 20s）
-          for i in $(seq 1 20); do
-            curl -sf -m 2 http://localhost:3340/ >/dev/null 2>&1 && break
-            sleep 1
-          done
-          # 1) 首页应包含 DERP 标识
-          curl -sf -m 5 http://localhost:3340/ | grep -q "DERP" && echo "✓ 首页 OK"
-          # 2) /derp 应返回 426 (WebSocket 升级要求) — Tailscale 客户端握手的预期行为
-          code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://localhost:3340/derp)
-          [ "$code" = "426" ] && echo "✓ /derp 端点 OK (HTTP 426)" || { echo "✗ /derp 返回 $code"; exit 1; }
-          docker rm -f derper-smoke >/dev/null
+          set -euo pipefail
+          IMG=$(printf '%s\n' "$META_TAGS" | head -1)
+          docker buildx imagetools inspect "$IMG" --format '{{json .Manifest}}' > manifest.json
+          jq -e '
+            [.manifests[].platform |
+              select(.os == "linux") |
+              if .architecture == "arm" then "linux/arm/" + (.variant // "")
+              else "linux/" + .architecture end] as $p |
+            ($p | index("linux/amd64")) and
+            ($p | index("linux/arm64")) and
+            ($p | index("linux/arm/v7"))
+          ' manifest.json >/dev/null
+          echo "✓ published manifest contains amd64, arm64, and arm/v7"

@@ -1,34 +1,54 @@
-# derper — Tailscale DERP server (自建镜像)
+# Tailscale DERP server — Linux 公网主机部署
 #
-# 部署前提（官方文档要求，详见 README）:
-#   1. 服务器必须直连公网，不能 NAT/防火墙/负载均衡
-#   2. 80/443(TCP) + 3478(UDP) 对外开放
-#   3. 允许双向 ICMP
-#   4. --verify-clients 要求宿主机同机运行 tailscaled 并加入 tailnet
+# 官方要求 DERP 直接接入公网，不能放在 NAT、反向代理或负载均衡器后面。
+# 因此生产部署使用 host network，避免 Docker bridge/端口映射改变入站源地址。
+# 此 compose 假定宿主机已经运行 tailscaled，并使用它的 LocalAPI 做客户端校验。
 #
-# 用法:
-#   1. docker compose build
-#   2. 修改 --hostname 为你的域名
-#   3. docker compose up -d
-#   4. 在 tailnet policy file 添加 derpMap 配置（RegionID 900-999）
+# 宿主机前置条件:
+#   1. tailscaled 已运行并加入你的 tailnet
+#   2. 宿主机 socket 存在: /var/run/tailscale/tailscaled.sock
+#   3. tailscaled 与 derper 来自同一个 Tailscale git revision（官方要求）
+#   4. DNS、云安全组/主机防火墙放行 TCP 80/443、UDP 3478 和双向 ICMP
+#
+# 使用:
+#   1. cp .env.example .env，然后填写 DERP_HOSTNAME / DERP_ACME_EMAIL
+#   2. 确认 DERPER_IMAGE 对应的 derper 上游版本与宿主机 tailscaled 匹配
+#   3. docker compose pull && docker compose up -d
+#   4. 在 tailnet policy file 添加 derpMap
+#
+# 注意: host network 是 Linux 服务器部署模式。OrbStack/macOS 上可以用它做构建，
+# 但不能据此判断 Mac 主机拥有可被公网访问的 DERP 端口。
 
 services:
   derper:
-    build: .
-    image: derper:latest
+    # 生产默认直接使用 GHCR 多架构镜像；可通过 DERPER_IMAGE 固定版本或 digest。
+    image: ${DERPER_IMAGE:-ghcr.io/neurocoda/derper:latest}
     container_name: derper
     restart: unless-stopped
-    ports:
-      - "80:80"          # HTTP (ACME http-01 验证, 端口不可自定义)
-      - "443:443"        # HTTPS / WSS 主流量
-      - "3478:3478/udp"  # STUN
+    network_mode: host
+    environment:
+      # entrypoint 会把这些环境变量转换成 derper 原生参数。
+      DERP_HOSTNAME: ${DERP_HOSTNAME:?请在 .env 中设置 DERP_HOSTNAME}
+      DERP_ACME_EMAIL: ${DERP_ACME_EMAIL:-}
+      DERP_CERTMODE: letsencrypt
+      DERP_CERTDIR: /certs
+      DERP_CONFIG: /var/lib/derper/derper.key
+      DERP_ADDR: :443
+      DERP_HTTP_PORT: "80"
+      DERP_STUN_PORT: "3478"
+      DERP_STUN: "true"
+      DERP_VERIFY_CLIENTS: "true"
+      DERP_SOCKET: /var/run/tailscale/tailscaled.sock
     volumes:
-      - ./certs:/certs   # 证书目录 (letsencrypt 模式自动写入)
-    command:
-      - --hostname=derp.example.com   # ← 改成你的域名
-      - --certdir=/certs
-      - --verify-clients              # 只允许 tailnet 内认证客户端 (需宿主同机跑 tailscaled)
-      # 可选参数:
-      # - --certmode=letsencrypt      # 默认; 公网 443 可达即自动签证书
-      # - --stun=false                # 内网自用可关掉 STUN
-      # - --http-port=-1              # 禁用 HTTP(80) —— 但会破坏 ACME 验证, 慎用
+      # Let's Encrypt 账户与证书缓存；自动续期依赖此目录持久化
+      - ./certs:/certs
+      # DERP 节点私钥；必须持久化，否则重建后 DERP 节点身份会变化
+      - ./derper-data:/var/lib/derper
+      # tailscaled LocalAPI；只读挂载目录即可连接 Unix socket
+      - /var/run/tailscale:/var/run/tailscale:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/generate_204"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

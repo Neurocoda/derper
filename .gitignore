@@ -1,8 +1,10 @@
 # 依赖
 node_modules/
 
-# 构建产物
+# 本地部署配置与运行状态
+.env
 certs/
+derper-data/
 *.log
 
 # 系统文件
